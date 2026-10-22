@@ -28,7 +28,18 @@ function App() {
   const [loadError, setLoadError] = useState('');
   const [checkoutError, setCheckoutError] = useState('');
   const [submitting, setSubmitting] = useState(false);
-  const [activeOrder, setActiveOrder] = useState<OrderCreated | null>(null);
+  const [activeOrder, setActiveOrder] = useState<OrderCreated | null>(() => {
+    try {
+      const saved = window.localStorage.getItem('pickup-counter:active-order');
+      if (!saved) return null;
+      const order = JSON.parse(saved) as OrderCreated;
+      if (!order?.id || !Array.isArray(order.items) || !order.expiresAt) return null;
+      return { ...order, expiresInSeconds: Math.max(0, Math.ceil((new Date(order.expiresAt).getTime() - Date.now()) / 1000)) };
+    } catch {
+      return null;
+    }
+  });
+  const [showPayment, setShowPayment] = useState(false);
   const [search, setSearch] = useState('');
   const [category, setCategory] = useState('All snacks');
   const [sortBy, setSortBy] = useState<'featured' | 'price-low' | 'price-high'>('featured');
@@ -59,6 +70,18 @@ function App() {
     dispatchCart({ type: 'set', productId, quantity: Math.max(0, Math.min(quantity, product.availableUnits)) });
   }, [products]);
 
+  useEffect(() => {
+    try {
+      if (activeOrder) {
+        window.localStorage.setItem('pickup-counter:active-order', JSON.stringify(activeOrder));
+      } else {
+        window.localStorage.removeItem('pickup-counter:active-order');
+      }
+    } catch {
+      // Checkout remains usable if browser storage is unavailable.
+    }
+  }, [activeOrder]);
+
   const checkout = async () => {
     setCheckoutError('');
     setSubmitting(true);
@@ -68,7 +91,7 @@ function App() {
           .filter(([, quantity]) => quantity > 0)
           .map(([productId, quantity]) => ({ productId, quantity })),
       );
-      setActiveOrder(order);
+      setActiveOrder(order);\n      setShowPayment(true);
     } catch (error) {
       setCheckoutError(error instanceof Error ? error.message : 'We couldn’t reserve your items. Please try again.');
       await loadProducts(false);
@@ -78,10 +101,19 @@ function App() {
   };
 
   const backToCatalog = () => {
-    setActiveOrder(null);
+    setShowPayment(false);
     dispatchCart({ type: 'clear' });
     setCheckoutError('');
-    void loadProducts();
+    void loadProducts(false);
+  };
+
+  const returnToPayment = () => {
+    if (!activeOrder) return;
+    setActiveOrder({
+      ...activeOrder,
+      expiresInSeconds: Math.max(0, Math.ceil((new Date(activeOrder.expiresAt).getTime() - Date.now()) / 1000)),
+    });
+    setShowPayment(true);
   };
 
   const filteredProducts = useMemo(() => {
@@ -113,7 +145,7 @@ function App() {
         <a className="header-cart" href="#cart" onClick={(event) => { event.preventDefault(); document.getElementById('cart-title')?.scrollIntoView({ behavior: 'smooth', block: 'center' }); }}><span className="header-cart__icon"><Utensils size={17} aria-hidden="true" /></span><span>My bag</span><span className="header-cart__count">{itemCount}</span></a>
       </header>
 
-      {activeOrder ? (
+      {activeOrder && showPayment ? (
         <main className="checkout-page"><PaymentPanel order={activeOrder} onBackToCatalog={backToCatalog} /></main>
       ) : (
         <main id="home">
@@ -139,6 +171,17 @@ function App() {
           <section className="trust-strip" aria-label="Counter benefits"><div><ShieldCheck size={17} /><span>Secure reservation</span></div><span className="trust-separator" /><div><ClockLabel /><span>Ready in a couple of minutes</span></div><span className="trust-separator" /><div><Leaf size={17} /><span>Simple, thoughtful picks</span></div></section>
 
           <section className="catalog-section" id="menu">
+            {activeOrder && (
+              <div className="resume-checkout-banner" role="status">
+                <div>
+                  <strong>You have an order in progress</strong>
+                  <p>Order #{activeOrder.id.slice(-6).toUpperCase()} · Check its latest payment status or return to checkout.</p>
+                </div>
+                <button type="button" className="button button--primary" onClick={returnToPayment}>
+                  Return to payment <ArrowRight size={16} aria-hidden="true" />
+                </button>
+              </div>
+            )}
             <div className="section-heading"><div><p className="eyebrow">THE GOOD STUFF</p><h2>Pick your little <em>something.</em></h2><p className="section-description">A few favourites for your next small moment of joy.</p></div><div className="catalog-live"><span /> Live stock <small>refreshes automatically</small></div></div>
             {loadError && <div className="page-alert" role="alert"><Wifi size={17} /><div><strong>We can’t reach the counter.</strong><p>{loadError}</p></div><button className="button button--secondary" onClick={() => void loadProducts()}>Try again</button></div>}
             <div className="catalog-toolbar">
