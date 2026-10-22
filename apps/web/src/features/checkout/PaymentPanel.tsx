@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { getOrderStatus } from '../../lib/api';
 import { AlertTriangle, ArrowLeft, CheckCircle2, Clock3, Copy, LoaderCircle, RefreshCw, ShieldCheck } from 'lucide-react';
 import type { OrderCreated, OrderStatus } from '../../types/api';
 import { formatPaise } from '../../lib/money';
@@ -54,7 +55,6 @@ export function PaymentPanel({ order, onBackToCatalog }: PaymentPanelProps) {
 
     const poll = async () => {
       try {
-        const { getOrderStatus } = await import('../../lib/api');
         const result = await getOrderStatus(order.id);
         if (stopped) return;
         failures = 0;
