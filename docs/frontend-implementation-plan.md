@@ -9,7 +9,7 @@ Build a polished, responsive customer kiosk UI around the existing NestJS API wi
 - GET /orders/:id → { id, status, totalPaise, expiresAt }
 - POST /payments/webhook is server-only; do not call it directly from the browser because the HMAC secret must never be exposed client-side.
 - POST /orders/:id/pickup-claim is a locker endpoint; no need to expose as a customer action in the first UI.
-- API currently listens on port 3000 by default. CORS and API base URL need to be configured for local development/production.
+- API currently listens on port 3000 by default. API base URL is centralized in `src/lib/api.ts`; Vite proxies `/api` to `http://localhost:3000` by default.
 
 ## UX scope
 1. Catalog landing page with branded top bar, availability/status labels, product cards, price in INR formatted from integer paise, stock-aware quantity controls.
