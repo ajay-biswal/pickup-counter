@@ -94,8 +94,8 @@ function App() {
       return matchesSearch && matchesCategory;
     });
 
-    if (sortBy === 'price-low') return filtered.sort((a, b) => a.pricePaise - b.pricePaise);
-    if (sortBy === 'price-high') return filtered.sort((a, b) => b.pricePaise - a.pricePaise);
+    if (sortBy === 'price-low') return [...filtered].sort((a, b) => a.pricePaise - b.pricePaise);
+    if (sortBy === 'price-high') return [...filtered].sort((a, b) => b.pricePaise - a.pricePaise);
     return filtered;
   }, [products, search, category, sortBy]);
 
