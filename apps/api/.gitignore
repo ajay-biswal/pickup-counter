@@ -1,0 +1,23 @@
+
+# Dependencies
+node_modules/
+
+# Environment files and secrets
+.env
+.env.*
+!.env.example
+
+# Generated Prisma client
+/generated/prisma/
+
+# Build output
+/dist/
+
+# TypeScript build cache
+*.tsbuildinfo
+
+# Local AI-tool state (only if not intentionally shared)
+.agents/
+.claude/
+.cursor/
+.devin/

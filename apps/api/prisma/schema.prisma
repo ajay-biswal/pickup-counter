@@ -1,0 +1,67 @@
+generator client {
+  provider = "prisma-client-js"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum OrderStatus {
+  HELD
+  PAID
+  EXPIRED
+  NEEDS_REVIEW
+  PICKED_UP
+}
+
+model Product {
+  id        String      @id @default(cuid())
+  name      String      @unique
+  pricePaise Int
+  stock     Int
+  createdAt DateTime    @default(now())
+  updatedAt DateTime    @updatedAt
+  orderItems OrderItem[]
+
+  @@index([name])
+}
+
+model Order {
+  id         String      @id @default(cuid())
+  status     OrderStatus @default(HELD)
+  totalPaise Int
+  expiresAt  DateTime
+  createdAt  DateTime    @default(now())
+  updatedAt  DateTime    @updatedAt
+  items      OrderItem[]
+
+  @@index([status, expiresAt])
+}
+
+model OrderItem {
+  id        String  @id @default(cuid())
+  orderId   String
+  productId String
+  quantity  Int
+  pricePaise Int
+
+  order     Order   @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  product   Product @relation(fields: [productId], references: [id], onDelete: Restrict)
+
+  @@unique([orderId, productId])
+  @@index([productId])
+}
+
+model PaymentEvent {
+  id             String   @id @default(cuid())
+  eventId        String   @unique
+  orderId        String
+  amountPaise    Int
+  providerStatus String
+  payload        Json
+  processedAt    DateTime @default(now())
+
+  @@index([orderId])
+}
