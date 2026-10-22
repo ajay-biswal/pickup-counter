@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useMemo, useReducer, useState } from 'react';
-import { ArrowDownWideNarrow, ArrowRight, Check, ChevronDown, CircleHelp, Coffee, Leaf, LoaderCircle, Search, ShieldCheck, Sparkles, Utensils, Wifi, X } from 'lucide-react';
+import { ArrowDownWideNarrow, ArrowRight, Check, ChevronDown, CircleHelp, Clock3, Coffee, Leaf, Search, ShieldCheck, Sparkles, Utensils, Wifi, X } from 'lucide-react';
 import { getProducts, createOrder } from './lib/api';
-import { formatPaise } from './lib/money';
 import { ProductCard } from './features/catalog/ProductCard';
 import { CartPanel } from './features/cart/CartPanel';
 import { PaymentPanel } from './features/checkout/PaymentPanel';
@@ -101,7 +100,6 @@ function App() {
   }, [products, search, category, sortBy]);
 
   const itemCount = Object.values(cart).reduce((sum, quantity) => sum + quantity, 0);
-  const subtotal = products.reduce((sum, product) => sum + product.pricePaise * (cart[product.id] ?? 0), 0);
 
   return (
     <div className="app-shell">
@@ -172,7 +170,7 @@ function App() {
 }
 
 function ClockLabel() {
-  return <span className="clock-label"><LoaderCircle size={16} aria-hidden="true" /></span>;
+  return <span className="clock-label"><Clock3 size={16} aria-hidden="true" /></span>;
 }
 
 export default App;
