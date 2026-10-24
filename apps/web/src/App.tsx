@@ -91,7 +91,8 @@ function App() {
           .filter(([, quantity]) => quantity > 0)
           .map(([productId, quantity]) => ({ productId, quantity })),
       );
-      setActiveOrder(order);\n      setShowPayment(true);
+      setActiveOrder(order);
+      setShowPayment(true);
     } catch (error) {
       setCheckoutError(error instanceof Error ? error.message : 'We couldn’t reserve your items. Please try again.');
       await loadProducts(false);

@@ -2,6 +2,9 @@ import type {
   OrderCreated,
   OrderStatusResponse,
   Product,
+    RazorpayOrderResponse,
+  RazorpayCheckoutResponse,
+  PaymentVerificationResponse,
 } from '../types/api';
 
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL ?? '/api').replace(/\/$/, '');
@@ -56,4 +59,28 @@ export function createOrder(items: Array<{ productId: string; quantity: number }
 
 export function getOrderStatus(orderId: string): Promise<OrderStatusResponse> {
   return request<OrderStatusResponse>(`/orders/${encodeURIComponent(orderId)}`);
+}
+
+export function createRazorpayOrder(
+  orderId: string,
+): Promise<RazorpayOrderResponse> {
+  return request<RazorpayOrderResponse>('/payments/create-order', {
+    method: 'POST',
+    body: JSON.stringify({ orderId }),
+  });
+}
+
+export function verifyRazorpayPayment(
+  orderId: string,
+  response: RazorpayCheckoutResponse,
+): Promise<PaymentVerificationResponse> {
+  return request<PaymentVerificationResponse>('/payments/verify', {
+    method: 'POST',
+    body: JSON.stringify({
+      orderId,
+      razorpay_order_id: response.razorpay_order_id,
+      razorpay_payment_id: response.razorpay_payment_id,
+      razorpay_signature: response.razorpay_signature,
+    }),
+  });
 }

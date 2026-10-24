@@ -1,8 +1,89 @@
 import { useEffect, useState } from 'react';
-import { getOrderStatus } from '../../lib/api';
+import {  createRazorpayOrder,
+  getOrderStatus,
+  verifyRazorpayPayment, } from '../../lib/api';
 import { AlertTriangle, ArrowLeft, CheckCircle2, Clock3, Copy, LoaderCircle, RefreshCw, ShieldCheck } from 'lucide-react';
-import type { OrderCreated, OrderStatus } from '../../types/api';
+import type {
+  OrderCreated,
+  OrderStatus,
+  RazorpayCheckoutResponse,
+} from '../../types/api';
 import { formatPaise } from '../../lib/money';
+
+
+interface RazorpayOptions {
+  key: string;
+  amount: number;
+  currency: string;
+  name: string;
+  description: string;
+  order_id: string;
+  handler: (response: RazorpayCheckoutResponse) => void | Promise<void>;
+  modal: {
+    ondismiss: () => void;
+  };
+  theme?: {
+    color: string;
+  };
+}
+
+interface RazorpayInstance {
+  open: () => void;
+  on: (
+    event: 'payment.failed',
+    callback: (response: {
+      error?: { description?: string; reason?: string };
+    }) => void,
+  ) => void;
+}
+
+declare global {
+  interface Window {
+    Razorpay?: new (options: RazorpayOptions) => RazorpayInstance;
+  }
+}
+
+function loadRazorpayScript(): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (window.Razorpay) {
+      resolve();
+      return;
+    }
+
+    const existing = document.querySelector<HTMLScriptElement>(
+      'script[data-razorpay-checkout]',
+    );
+
+    const script = existing ?? document.createElement('script');
+
+    const onLoad = () => {
+      cleanup();
+      if (window.Razorpay) resolve();
+      else reject(new Error('Razorpay Checkout did not load correctly.'));
+    };
+
+    const onError = () => {
+      cleanup();
+      reject(new Error('Could not load Razorpay Checkout. Check your connection.'));
+    };
+
+    const cleanup = () => {
+      script.removeEventListener('load', onLoad);
+      script.removeEventListener('error', onError);
+    };
+
+    script.addEventListener('load', onLoad);
+    script.addEventListener('error', onError);
+
+    if (!existing) {
+      script.src = 'https://checkout.razorpay.com/v1/checkout.js';
+      script.async = true;
+      script.dataset.razorpayCheckout = 'true';
+      document.head.appendChild(script);
+    }
+  });
+}
+
 
 interface PaymentPanelProps {
   order: OrderCreated;
@@ -33,6 +114,8 @@ export function PaymentPanel({ order, onBackToCatalog }: PaymentPanelProps) {
   const [secondsLeft, setSecondsLeft] = useState(Math.max(0, order.expiresInSeconds));
   const [pollError, setPollError] = useState('');
   const [copied, setCopied] = useState(false);
+  const [paymentLoading, setPaymentLoading] = useState(false);
+const [paymentError, setPaymentError] = useState('');
 
   useEffect(() => {
     // performance.now is monotonic and avoids relying on the customer's wall clock.
@@ -81,6 +164,79 @@ export function PaymentPanel({ order, onBackToCatalog }: PaymentPanelProps) {
       if (timeout !== undefined) window.clearTimeout(timeout);
     };
   }, [order.id]);
+
+
+const startPayment = async () => {
+  if (paymentLoading || terminal || secondsLeft <= 0) return;
+
+  setPaymentLoading(true);
+  setPaymentError('');
+
+  try {
+    const checkoutOrder = await createRazorpayOrder(order.id);
+    await loadRazorpayScript();
+
+    if (!window.Razorpay) {
+      throw new Error('Razorpay Checkout is unavailable.');
+    }
+
+    const checkout = new window.Razorpay({
+      key: checkoutOrder.keyId,
+      amount: checkoutOrder.amount,
+      currency: checkoutOrder.currency,
+      name: 'the little COUNTER',
+      description: 'Snack counter order',
+      order_id: checkoutOrder.razorpayOrderId,
+      theme: { color: '#27866f' },
+
+      handler: async (response) => {
+        try {
+          const result = await verifyRazorpayPayment(
+            order.id,
+            response,
+          );
+
+          if (result.verified && result.status === 'PAID') {
+            setStatus('PAID');
+            setPaymentError('');
+          } else {
+            setPaymentError(
+              'Payment verification is pending. Please wait while we check your order.',
+            );
+          }
+        } catch {
+          setPaymentError(
+            'We could not verify the payment yet. Please do not pay again; your order status will keep refreshing.',
+          );
+        } finally {
+          setPaymentLoading(false);
+        }
+      },
+
+      modal: {
+        ondismiss: () => setPaymentLoading(false),
+      },
+    });
+
+    checkout.on('payment.failed', (response) => {
+      setPaymentError(
+        response.error?.description ??
+          'Payment did not complete. You can try again while your reservation is active.',
+      );
+      setPaymentLoading(false);
+    });
+
+    checkout.open();
+  } catch (error) {
+    setPaymentError(
+      error instanceof Error
+        ? error.message
+        : 'Unable to start checkout. Please try again.',
+    );
+    setPaymentLoading(false);
+  }
+};
+
 
   const copyOrderId = async () => {
     try {
@@ -139,21 +295,55 @@ export function PaymentPanel({ order, onBackToCatalog }: PaymentPanelProps) {
               </div>
               <p className="countdown-footnote">Time remaining on this reservation</p>
             </div>
-            <div className="demo-payment-card">
-              <div className="demo-payment-card__header">
-                <div className="upi-mark">UPI</div>
-                <div><h2>Simulated UPI payment</h2><p>No real money will be moved.</p></div>
-                <span className="demo-badge">DEMO</span>
-              </div>
-              <div className="demo-payment-instructions">
-                <div className="demo-payment-graphic" aria-hidden="true">
-                  <div className="demo-payment-graphic__ring"><ShieldCheck size={38} /></div>
-                  <span>DEMO ONLY</span>
-                </div>
-                <div><strong>Payment simulation is ready</strong><p>To simulate a captured payment, run the signed webhook script from your terminal. The signing secret stays on the server.</p></div>
-              </div>
-              <div className="payment-amount-row"><span>Amount due</span><strong>{formatPaise(order.totalPaise)}</strong></div>
-            </div>
+            
+<div className="demo-payment-card">
+  <div className="demo-payment-card__header">
+    <div className="upi-mark">₹</div>
+    <div>
+      <h2>Pay securely with Razorpay</h2>
+      <p>UPI, cards and other methods enabled for this account.</p>
+    </div>
+    <span className="demo-badge">TEST MODE</span>
+  </div>
+
+  <div className="demo-payment-instructions">
+    <div className="demo-payment-graphic" aria-hidden="true">
+      <div className="demo-payment-graphic__ring">
+        <ShieldCheck size={38} />
+      </div>
+      <span>SECURE CHECKOUT</span>
+    </div>
+    <div>
+      <strong>Ready when you are</strong>
+      <p>
+        Razorpay will securely collect your payment details.
+        This integration currently uses your test credentials.
+      </p>
+    </div>
+  </div>
+
+  <div className="payment-amount-row">
+    <span>Amount due</span>
+    <strong>{formatPaise(order.totalPaise)}</strong>
+  </div>
+
+  {paymentError && (
+    <div className="inline-alert" role="alert">
+      <AlertTriangle size={16} />
+      <span>{paymentError}</span>
+    </div>
+  )}
+
+  <button
+    type="button"
+    className="button button--primary"
+    onClick={() => void startPayment()}
+    disabled={paymentLoading || secondsLeft <= 0}
+  >
+    {paymentLoading ? 'Opening secure checkout…' : `Pay ${formatPaise(order.totalPaise)}`}
+  </button>
+</div>
+
             {pollError && <div className="inline-alert"><AlertTriangle size={16} /><span>{pollError} We’ll keep retrying automatically.</span><button type="button" onClick={() => window.location.reload()} aria-label="Refresh checkout status"><RefreshCw size={15} /></button></div>}
           </>
         )}

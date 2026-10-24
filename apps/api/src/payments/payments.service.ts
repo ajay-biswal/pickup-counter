@@ -3,10 +3,14 @@ import {
   UnauthorizedException,
   BadRequestException,
   ConflictException,
+  NotFoundException,
+  ServiceUnavailableException
 } from '@nestjs/common';
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import { Prisma } from '../../generated/prisma/index.js';
 import { PrismaService } from '../prisma.service.js';
+import Razorpay from 'razorpay';
+
 
 type PaymentWebhook = {
   eventId: string;
@@ -18,6 +22,75 @@ type PaymentWebhook = {
 @Injectable()
 export class PaymentsService {
   constructor(private readonly prisma: PrismaService) {}
+
+
+  async createRazorpayOrder(orderId: string) {
+    const keyId = process.env.RAZORPAY_KEY_ID;
+    const keySecret = process.env.RAZORPAY_KEY_SECRET;
+
+    if (!keyId || !keySecret) {
+      throw new ServiceUnavailableException(
+        'Razorpay is not configured',
+      );
+    }
+
+    if (!orderId || !orderId.trim()) {
+      throw new BadRequestException('Order ID is required');
+    }
+
+    const order = await this.prisma.order.findUnique({
+      where: { id: orderId.trim() },
+    });
+
+    if (!order) {
+      throw new NotFoundException('Order not found');
+    }
+
+    if (order.status !== 'HELD' || order.expiresAt <= new Date()) {
+      throw new ConflictException(
+        'Order is no longer eligible for payment',
+      );
+    }
+
+    // Reuse the gateway order when one was already saved.
+    if (order.razorpayOrderId) {
+      return {
+        keyId,
+        razorpayOrderId: order.razorpayOrderId,
+        amount: order.totalPaise,
+        currency: 'INR',
+        internalOrderId: order.id,
+      };
+    }
+
+    const razorpay = new Razorpay({
+      key_id: keyId,
+      key_secret: keySecret,
+    });
+
+    const gatewayOrder = await razorpay.orders.create({
+      amount: order.totalPaise,
+      currency: 'INR',
+      receipt: order.id,
+      notes: {
+        internalOrderId: order.id,
+      },
+    });
+
+    await this.prisma.order.update({
+      where: { id: order.id },
+      data: { razorpayOrderId: gatewayOrder.id },
+    });
+
+    return {
+      keyId,
+      razorpayOrderId: gatewayOrder.id,
+      amount: gatewayOrder.amount,
+      currency: gatewayOrder.currency,
+      internalOrderId: order.id,
+    };
+  }
+
 
   private verifySignature(rawBody: Buffer, signature: string | undefined) {
     const secret = process.env.PAYMENT_WEBHOOK_SECRET;
@@ -52,6 +125,135 @@ export class PaymentsService {
       throw new UnauthorizedException('Invalid payment signature');
     }
   }
+
+
+  async verifyRazorpayPayment(input: {
+    orderId: string;
+    razorpay_order_id: string;
+    razorpay_payment_id: string;
+    razorpay_signature: string;
+  }) {
+    const keyId = process.env.RAZORPAY_KEY_ID;
+    const keySecret = process.env.RAZORPAY_KEY_SECRET;
+
+    if (!keyId || !keySecret) {
+      throw new ServiceUnavailableException(
+        'Razorpay is not configured',
+      );
+    }
+
+    const {
+      orderId,
+      razorpay_order_id,
+      razorpay_payment_id,
+      razorpay_signature,
+    } = input;
+
+    if (
+      !orderId?.trim() ||
+      !razorpay_order_id?.trim() ||
+      !razorpay_payment_id?.trim() ||
+      !/^[a-fA-F0-9]{64}$/.test(razorpay_signature ?? '')
+    ) {
+      throw new BadRequestException('Invalid payment verification data');
+    }
+
+    const expectedSignature = createHmac('sha256', keySecret)
+      .update(`${razorpay_order_id}|${razorpay_payment_id}`)
+      .digest();
+
+    const actualSignature = Buffer.from(razorpay_signature, 'hex');
+
+    if (
+      actualSignature.length !== expectedSignature.length ||
+      !timingSafeEqual(actualSignature, expectedSignature)
+    ) {
+      throw new UnauthorizedException('Invalid Razorpay signature');
+    }
+
+    const order = await this.prisma.order.findUnique({
+      where: { id: orderId.trim() },
+    });
+
+    if (!order) {
+      throw new NotFoundException('Order not found');
+    }
+
+    if (order.razorpayOrderId !== razorpay_order_id) {
+      throw new ConflictException('Razorpay order does not match');
+    }
+
+    const razorpay = new Razorpay({
+      key_id: keyId,
+      key_secret: keySecret,
+    });
+
+    const payment = await razorpay.payments.fetch(razorpay_payment_id);
+
+    if (
+      payment.order_id !== order.razorpayOrderId ||
+      payment.amount !== order.totalPaise ||
+      payment.currency !== 'INR'
+    ) {
+      throw new ConflictException('Payment details do not match the order');
+    }
+
+    if (payment.status !== 'captured') {
+      throw new ConflictException(
+        `Payment is not captured (status: ${payment.status})`,
+      );
+    }
+
+    return this.prisma.$transaction(async (tx) => {
+      const locked = await tx.$queryRaw<{ id: string }[]>`
+        SELECT id FROM "Order" WHERE id = ${order.id} FOR UPDATE
+      `;
+
+      if (locked.length === 0) {
+        throw new NotFoundException('Order not found');
+      }
+
+      const current = await tx.order.findUniqueOrThrow({
+        where: { id: order.id },
+      });
+
+      if (current.status === 'PAID') {
+        return {
+          verified: true,
+          status: 'PAID',
+          orderId: current.id,
+        };
+      }
+
+      if (
+        current.status !== 'HELD' ||
+        current.expiresAt <= new Date()
+      ) {
+        if (current.status === 'HELD' || current.status === 'EXPIRED') {
+          await tx.order.update({
+            where: { id: current.id },
+            data: { status: 'NEEDS_REVIEW' },
+          });
+        }
+
+        throw new ConflictException(
+          'Order is no longer eligible for payment',
+        );
+      }
+
+      await tx.order.update({
+        where: { id: current.id },
+        data: { status: 'PAID' },
+      });
+
+      return {
+        verified: true,
+        status: 'PAID',
+        orderId: current.id,
+      };
+    });
+  }
+
 
   async handleWebhook(
     body: unknown,

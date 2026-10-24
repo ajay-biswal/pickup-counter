@@ -29,10 +29,11 @@ model Product {
 }
 
 model Order {
-  id         String      @id @default(cuid())
-  status     OrderStatus @default(HELD)
-  totalPaise Int
-  expiresAt  DateTime
+  id           String      @id @default(cuid())
+  status       OrderStatus @default(HELD)
+  totalPaise   Int
+  expiresAt    DateTime
+  razorpayOrderId String? @unique
   createdAt  DateTime    @default(now())
   updatedAt  DateTime    @updatedAt
   items      OrderItem[]
