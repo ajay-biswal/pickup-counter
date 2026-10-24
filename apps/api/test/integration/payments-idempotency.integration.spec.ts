@@ -1,4 +1,3 @@
-
 import { createHmac } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { PaymentsService } from '../../src/payments/payments.service.js';
@@ -78,10 +77,7 @@ describe('Payment webhook (real PostgreSQL)', () => {
   }) {
     const rawBody = Buffer.from(JSON.stringify(body));
 
-    const signature = createHmac(
-      'sha256',
-      process.env.PAYMENT_WEBHOOK_SECRET!,
-    )
+    const signature = createHmac('sha256', process.env.PAYMENT_WEBHOOK_SECRET!)
       .update(rawBody)
       .digest('hex');
 
@@ -115,6 +111,50 @@ describe('Payment webhook (real PostgreSQL)', () => {
     expect(eventCount).toBe(1);
   });
 
+  it('simulates payment from the stored order amount and rejects retries', async () => {
+    const order = await createHeldOrder();
+
+    const result = await service.simulatePayment(order.id);
+    expect(result).toMatchObject({ initiated: true, orderId: order.id });
+    await expect(service.simulatePayment(order.id)).rejects.toThrow();
+
+    const savedOrder = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    expect(savedOrder.status).toBe('PAID');
+
+    const events = await prisma.paymentEvent.findMany({
+      where: { orderId: order.id },
+    });
+    expect(events).toHaveLength(1);
+    expect(events[0]?.amountPaise).toBe(order.totalPaise);
+  });
+
+  it('allows only one concurrent simulation for an order', async () => {
+    const order = await createHeldOrder();
+    const results = await Promise.allSettled([
+      service.simulatePayment(order.id),
+      service.simulatePayment(order.id),
+    ]);
+
+    expect(
+      results.filter((result) => result.status === 'fulfilled'),
+    ).toHaveLength(1);
+    expect(
+      results.filter((result) => result.status === 'rejected'),
+    ).toHaveLength(1);
+
+    const events = await prisma.paymentEvent.findMany({
+      where: { orderId: order.id },
+    });
+    expect(events).toHaveLength(1);
+    expect(
+      await prisma.order.findUniqueOrThrow({ where: { id: order.id } }),
+    ).toMatchObject({
+      status: 'PAID',
+    });
+  });
+
   it('flags a payment with an incorrect amount for review', async () => {
     const order = await createHeldOrder();
 
@@ -135,26 +175,26 @@ describe('Payment webhook (real PostgreSQL)', () => {
   });
 
   it('flags a payment received after the hold expires for review', async () => {
-  const order = await createHeldOrder();
+    const order = await createHeldOrder();
 
-  await prisma.order.update({
-    where: { id: order.id },
-    data: { expiresAt: new Date(Date.now() - 1_000) },
+    await prisma.order.update({
+      where: { id: order.id },
+      data: { expiresAt: new Date(Date.now() - 1_000) },
+    });
+
+    const result = await sendSignedEvent({
+      eventId: `evt_late_payment_${Date.now()}`,
+      orderId: order.id,
+      amountPaise: 500,
+      status: 'captured',
+    });
+
+    expect(result.outcome).toBe('LATE_OR_INELIGIBLE_PAYMENT_REVIEW');
+
+    const savedOrder = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+
+    expect(savedOrder.status).toBe('NEEDS_REVIEW');
   });
-
-  const result = await sendSignedEvent({
-    eventId: `evt_late_payment_${Date.now()}`,
-    orderId: order.id,
-    amountPaise: 500,
-    status: 'captured',
-  });
-
-  expect(result.outcome).toBe('LATE_OR_INELIGIBLE_PAYMENT_REVIEW');
-
-  const savedOrder = await prisma.order.findUniqueOrThrow({
-    where: { id: order.id },
-  });
-
-  expect(savedOrder.status).toBe('NEEDS_REVIEW');
-});
 });

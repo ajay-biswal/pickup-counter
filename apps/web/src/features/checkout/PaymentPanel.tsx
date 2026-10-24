@@ -1,90 +1,11 @@
 import { useEffect, useState } from 'react';
-import {  createRazorpayOrder,
-  getOrderStatus,
-  verifyRazorpayPayment, } from '../../lib/api';
+import { getOrderStatus, simulatePayment } from '../../lib/api';
 import { AlertTriangle, ArrowLeft, CheckCircle2, Clock3, Copy, LoaderCircle, RefreshCw, ShieldCheck } from 'lucide-react';
 import type {
   OrderCreated,
   OrderStatus,
-  RazorpayCheckoutResponse,
 } from '../../types/api';
 import { formatPaise } from '../../lib/money';
-
-
-interface RazorpayOptions {
-  key: string;
-  amount: number;
-  currency: string;
-  name: string;
-  description: string;
-  order_id: string;
-  handler: (response: RazorpayCheckoutResponse) => void | Promise<void>;
-  modal: {
-    ondismiss: () => void;
-  };
-  theme?: {
-    color: string;
-  };
-}
-
-interface RazorpayInstance {
-  open: () => void;
-  on: (
-    event: 'payment.failed',
-    callback: (response: {
-      error?: { description?: string; reason?: string };
-    }) => void,
-  ) => void;
-}
-
-declare global {
-  interface Window {
-    Razorpay?: new (options: RazorpayOptions) => RazorpayInstance;
-  }
-}
-
-function loadRazorpayScript(): Promise<void> {
-  return new Promise((resolve, reject) => {
-    if (window.Razorpay) {
-      resolve();
-      return;
-    }
-
-    const existing = document.querySelector<HTMLScriptElement>(
-      'script[data-razorpay-checkout]',
-    );
-
-    const script = existing ?? document.createElement('script');
-
-    const onLoad = () => {
-      cleanup();
-      if (window.Razorpay) resolve();
-      else reject(new Error('Razorpay Checkout did not load correctly.'));
-    };
-
-    const onError = () => {
-      cleanup();
-      reject(new Error('Could not load Razorpay Checkout. Check your connection.'));
-    };
-
-    const cleanup = () => {
-      script.removeEventListener('load', onLoad);
-      script.removeEventListener('error', onError);
-    };
-
-    script.addEventListener('load', onLoad);
-    script.addEventListener('error', onError);
-
-    if (!existing) {
-      script.src = 'https://checkout.razorpay.com/v1/checkout.js';
-      script.async = true;
-      script.dataset.razorpayCheckout = 'true';
-      document.head.appendChild(script);
-    }
-  });
-}
-
-
 interface PaymentPanelProps {
   order: OrderCreated;
   onBackToCatalog: () => void;
@@ -94,6 +15,10 @@ function formatTime(seconds: number) {
   const minutes = Math.floor(seconds / 60).toString().padStart(2, '0');
   const remainder = Math.floor(seconds % 60).toString().padStart(2, '0');
   return `${minutes}:${remainder}`;
+}
+
+function isTerminalStatus(status: OrderStatus) {
+  return status === 'PAID' || status === 'EXPIRED' || status === 'NEEDS_REVIEW' || status === 'PICKED_UP';
 }
 
 function statusCopy(status: OrderStatus) {
@@ -115,7 +40,8 @@ export function PaymentPanel({ order, onBackToCatalog }: PaymentPanelProps) {
   const [pollError, setPollError] = useState('');
   const [copied, setCopied] = useState(false);
   const [paymentLoading, setPaymentLoading] = useState(false);
-const [paymentError, setPaymentError] = useState('');
+  const [paymentError, setPaymentError] = useState('');
+  const [confirmationPending, setConfirmationPending] = useState(false);
 
   useEffect(() => {
     // performance.now is monotonic and avoids relying on the customer's wall clock.
@@ -143,8 +69,12 @@ const [paymentError, setPaymentError] = useState('');
         failures = 0;
         setPollError('');
         setStatus(result.status);
+        if (confirmationPending && result.status === 'HELD') {
+          setConfirmationPending(false);
+          setPaymentError('The payment was not confirmed. You can try again while your reservation is active.');
+        }
 
-        if (result.status === 'PAID' || result.status === 'EXPIRED' || result.status === 'NEEDS_REVIEW' || result.status === 'PICKED_UP') {
+        if (isTerminalStatus(result.status)) {
           return;
         }
       } catch (error) {
@@ -163,79 +93,26 @@ const [paymentError, setPaymentError] = useState('');
       stopped = true;
       if (timeout !== undefined) window.clearTimeout(timeout);
     };
-  }, [order.id]);
+  }, [confirmationPending, order.id]);
 
 
-const startPayment = async () => {
-  if (paymentLoading || terminal || secondsLeft <= 0) return;
+  const startPayment = async () => {
+    if (paymentLoading || confirmationPending || terminal || secondsLeft <= 0) return;
 
-  setPaymentLoading(true);
-  setPaymentError('');
-
-  try {
-    const checkoutOrder = await createRazorpayOrder(order.id);
-    await loadRazorpayScript();
-
-    if (!window.Razorpay) {
-      throw new Error('Razorpay Checkout is unavailable.');
-    }
-
-    const checkout = new window.Razorpay({
-      key: checkoutOrder.keyId,
-      amount: checkoutOrder.amount,
-      currency: checkoutOrder.currency,
-      name: 'the little COUNTER',
-      description: 'Snack counter order',
-      order_id: checkoutOrder.razorpayOrderId,
-      theme: { color: '#27866f' },
-
-      handler: async (response) => {
-        try {
-          const result = await verifyRazorpayPayment(
-            order.id,
-            response,
-          );
-
-          if (result.verified && result.status === 'PAID') {
-            setStatus('PAID');
-            setPaymentError('');
-          } else {
-            setPaymentError(
-              'Payment verification is pending. Please wait while we check your order.',
-            );
-          }
-        } catch {
-          setPaymentError(
-            'We could not verify the payment yet. Please do not pay again; your order status will keep refreshing.',
-          );
-        } finally {
-          setPaymentLoading(false);
-        }
-      },
-
-      modal: {
-        ondismiss: () => setPaymentLoading(false),
-      },
-    });
-
-    checkout.on('payment.failed', (response) => {
-      setPaymentError(
-        response.error?.description ??
-          'Payment did not complete. You can try again while your reservation is active.',
-      );
+    setPaymentLoading(true);
+    setPaymentError('');
+    try {
+      await simulatePayment(order.id);
+      setConfirmationPending(true);
+      setPaymentError('Payment submitted. Waiting for order confirmation…');
+    } catch {
+      // The server may have completed payment even if the response was lost.
+      setConfirmationPending(true);
+      setPaymentError('Confirmation is taking longer than expected. Checking your order status…');
+    } finally {
       setPaymentLoading(false);
-    });
-
-    checkout.open();
-  } catch (error) {
-    setPaymentError(
-      error instanceof Error
-        ? error.message
-        : 'Unable to start checkout. Please try again.',
-    );
-    setPaymentLoading(false);
-  }
-};
+    }
+  };
 
 
   const copyOrderId = async () => {
@@ -248,7 +125,7 @@ const startPayment = async () => {
     }
   };
 
-  const terminal = status === 'PAID' || status === 'EXPIRED' || status === 'NEEDS_REVIEW' || status === 'PICKED_UP';
+  const terminal = isTerminalStatus(status);
   const content = statusCopy(status === 'PICKED_UP' ? 'PAID' : status);
   const Icon = status === 'PAID' || status === 'PICKED_UP'
     ? CheckCircle2
@@ -268,7 +145,7 @@ const startPayment = async () => {
           <div className="step-indicator"><span>02</span><span> / 02</span></div>
           <p className="eyebrow">SECURE CHECKOUT · DEMO MODE</p>
           <h1 id="payment-heading">One last step.</h1>
-          <p className="page-subtitle">Confirm your payment and we’ll get your order ready.</p>
+          <p className="page-subtitle">Confirm your demo payment and we’ll get your order ready.</p>
         </div>
 
         <div className={`status-card ${content.className}`}>
@@ -300,8 +177,8 @@ const startPayment = async () => {
   <div className="demo-payment-card__header">
     <div className="upi-mark">₹</div>
     <div>
-      <h2>Pay securely with Razorpay</h2>
-      <p>UPI, cards and other methods enabled for this account.</p>
+      <h2>Simulated payment</h2>
+      <p>Demo mode · no real money is transferred.</p>
     </div>
     <span className="demo-badge">TEST MODE</span>
   </div>
@@ -311,13 +188,12 @@ const startPayment = async () => {
       <div className="demo-payment-graphic__ring">
         <ShieldCheck size={38} />
       </div>
-      <span>SECURE CHECKOUT</span>
+        <span>DEMO PAYMENT</span>
     </div>
     <div>
       <strong>Ready when you are</strong>
       <p>
-        Razorpay will securely collect your payment details.
-        This integration currently uses your test credentials.
+        The server will confirm this simulated payment. No gateway or payment details are used.
       </p>
     </div>
   </div>
@@ -338,9 +214,9 @@ const startPayment = async () => {
     type="button"
     className="button button--primary"
     onClick={() => void startPayment()}
-    disabled={paymentLoading || secondsLeft <= 0}
+    disabled={paymentLoading || confirmationPending || secondsLeft <= 0}
   >
-    {paymentLoading ? 'Opening secure checkout…' : `Pay ${formatPaise(order.totalPaise)}`}
+    {paymentLoading ? 'Submitting…' : confirmationPending ? 'Checking confirmation…' : `Simulate payment · ${formatPaise(order.totalPaise)}`}
   </button>
 </div>
 

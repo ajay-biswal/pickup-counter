@@ -31,6 +31,15 @@
 $ pnpm install
 ```
 
+## Local payment simulation
+
+Copy `.env.example` to `.env` and set `DATABASE_URL` and a private
+`PAYMENT_WEBHOOK_SECRET` for the API. The simulated checkout signs its payment
+event on the server and processes it through the same handler as signed webhook
+events. The browser does not receive this secret. No Razorpay credentials or
+external payment service are required; Razorpay payments are not part of the
+customer checkout flow.
+
 ## Compile and run the project
 
 ```bash

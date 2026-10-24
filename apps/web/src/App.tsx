@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useReducer, useState } from 'react';
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import { ArrowDownWideNarrow, ArrowRight, Check, ChevronDown, CircleHelp, Clock3, Coffee, Leaf, Search, ShieldCheck, Sparkles, Utensils, Wifi, X } from 'lucide-react';
 import { getProducts, createOrder } from './lib/api';
 import { ProductCard } from './features/catalog/ProductCard';
@@ -23,6 +23,8 @@ function cartReducer(state: Record<string, number>, action: CartAction): Record<
 
 function App() {
   const [products, setProducts] = useState<Product[]>([]);
+  const productsMountedRef = useRef(false);
+  const productsRequestRef = useRef<Promise<void> | null>(null);
   const [cart, dispatchCart] = useReducer(cartReducer, {});
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState('');
@@ -46,22 +48,42 @@ function App() {
   const [showHelp, setShowHelp] = useState(false);
 
   const loadProducts = useCallback(async (showSpinner = true) => {
+    if (!productsMountedRef.current) return;
+    if (productsRequestRef.current) return productsRequestRef.current;
     if (showSpinner) setLoading(true);
     setLoadError('');
-    try {
-      const results = await getProducts();
-      setProducts(results);
-    } catch (error) {
-      setLoadError(error instanceof Error ? error.message : 'Unable to load snacks.');
-    } finally {
-      setLoading(false);
-    }
+
+    const request = (async () => {
+      try {
+        const results = await getProducts();
+        if (productsMountedRef.current) setProducts(results);
+      } catch (error) {
+        if (productsMountedRef.current) {
+          setLoadError(error instanceof Error ? error.message : 'Unable to load snacks.');
+        }
+      } finally {
+        productsRequestRef.current = null;
+        if (productsMountedRef.current) setLoading(false);
+      }
+    })();
+    productsRequestRef.current = request;
+    return request;
   }, []);
 
   useEffect(() => {
-    void loadProducts();
+    let active = true;
+    productsMountedRef.current = true;
+    const loadInitialProducts = async () => {
+      await Promise.resolve();
+      if (active) void loadProducts();
+    };
+    void loadInitialProducts();
     const refresh = window.setInterval(() => void loadProducts(false), 15000);
-    return () => window.clearInterval(refresh);
+    return () => {
+      active = false;
+      productsMountedRef.current = false;
+      window.clearInterval(refresh);
+    };
   }, [loadProducts]);
 
   const updateQuantity = useCallback((productId: string, quantity: number) => {

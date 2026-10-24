@@ -4,13 +4,11 @@ import {
   BadRequestException,
   ConflictException,
   NotFoundException,
-  ServiceUnavailableException
+  ServiceUnavailableException,
 } from '@nestjs/common';
-import { createHmac, timingSafeEqual } from 'node:crypto';
+import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
 import { Prisma } from '../../generated/prisma/index.js';
 import { PrismaService } from '../prisma.service.js';
-import Razorpay from 'razorpay';
-
 
 type PaymentWebhook = {
   eventId: string;
@@ -19,83 +17,21 @@ type PaymentWebhook = {
   status: 'captured' | 'FAILED';
 };
 
+type PaymentOrder = {
+  id: string;
+  status: 'HELD' | 'PAID' | 'EXPIRED' | 'NEEDS_REVIEW' | 'PICKED_UP';
+  totalPaise: number;
+  expiresAt: Date;
+};
+
 @Injectable()
 export class PaymentsService {
   constructor(private readonly prisma: PrismaService) {}
 
-
-  async createRazorpayOrder(orderId: string) {
-    const keyId = process.env.RAZORPAY_KEY_ID;
-    const keySecret = process.env.RAZORPAY_KEY_SECRET;
-
-    if (!keyId || !keySecret) {
-      throw new ServiceUnavailableException(
-        'Razorpay is not configured',
-      );
-    }
-
-    if (!orderId || !orderId.trim()) {
-      throw new BadRequestException('Order ID is required');
-    }
-
-    const order = await this.prisma.order.findUnique({
-      where: { id: orderId.trim() },
-    });
-
-    if (!order) {
-      throw new NotFoundException('Order not found');
-    }
-
-    if (order.status !== 'HELD' || order.expiresAt <= new Date()) {
-      throw new ConflictException(
-        'Order is no longer eligible for payment',
-      );
-    }
-
-    // Reuse the gateway order when one was already saved.
-    if (order.razorpayOrderId) {
-      return {
-        keyId,
-        razorpayOrderId: order.razorpayOrderId,
-        amount: order.totalPaise,
-        currency: 'INR',
-        internalOrderId: order.id,
-      };
-    }
-
-    const razorpay = new Razorpay({
-      key_id: keyId,
-      key_secret: keySecret,
-    });
-
-    const gatewayOrder = await razorpay.orders.create({
-      amount: order.totalPaise,
-      currency: 'INR',
-      receipt: order.id,
-      notes: {
-        internalOrderId: order.id,
-      },
-    });
-
-    await this.prisma.order.update({
-      where: { id: order.id },
-      data: { razorpayOrderId: gatewayOrder.id },
-    });
-
-    return {
-      keyId,
-      razorpayOrderId: gatewayOrder.id,
-      amount: gatewayOrder.amount,
-      currency: gatewayOrder.currency,
-      internalOrderId: order.id,
-    };
-  }
-
-
   private verifySignature(rawBody: Buffer, signature: string | undefined) {
     const secret = process.env.PAYMENT_WEBHOOK_SECRET;
 
-    if (!secret) {
+    if (!secret?.trim()) {
       throw new Error('PAYMENT_WEBHOOK_SECRET is not configured');
     }
 
@@ -112,9 +48,7 @@ export class PaymentsService {
       throw new UnauthorizedException('Invalid payment signature');
     }
 
-    const expected = createHmac('sha256', secret)
-      .update(rawBody)
-      .digest();
+    const expected = createHmac('sha256', secret).update(rawBody).digest();
 
     const actual = Buffer.from(supplied, 'hex');
 
@@ -126,134 +60,109 @@ export class PaymentsService {
     }
   }
 
+  async simulatePayment(orderId: string) {
+    const normalizedId = orderId?.trim();
+    if (!normalizedId) throw new BadRequestException('Order ID is required');
 
-  async verifyRazorpayPayment(input: {
-    orderId: string;
-    razorpay_order_id: string;
-    razorpay_payment_id: string;
-    razorpay_signature: string;
-  }) {
-    const keyId = process.env.RAZORPAY_KEY_ID;
-    const keySecret = process.env.RAZORPAY_KEY_SECRET;
-
-    if (!keyId || !keySecret) {
+    const secret = process.env.PAYMENT_WEBHOOK_SECRET;
+    if (!secret?.trim()) {
       throw new ServiceUnavailableException(
-        'Razorpay is not configured',
-      );
-    }
-
-    const {
-      orderId,
-      razorpay_order_id,
-      razorpay_payment_id,
-      razorpay_signature,
-    } = input;
-
-    if (
-      !orderId?.trim() ||
-      !razorpay_order_id?.trim() ||
-      !razorpay_payment_id?.trim() ||
-      !/^[a-fA-F0-9]{64}$/.test(razorpay_signature ?? '')
-    ) {
-      throw new BadRequestException('Invalid payment verification data');
-    }
-
-    const expectedSignature = createHmac('sha256', keySecret)
-      .update(`${razorpay_order_id}|${razorpay_payment_id}`)
-      .digest();
-
-    const actualSignature = Buffer.from(razorpay_signature, 'hex');
-
-    if (
-      actualSignature.length !== expectedSignature.length ||
-      !timingSafeEqual(actualSignature, expectedSignature)
-    ) {
-      throw new UnauthorizedException('Invalid Razorpay signature');
-    }
-
-    const order = await this.prisma.order.findUnique({
-      where: { id: orderId.trim() },
-    });
-
-    if (!order) {
-      throw new NotFoundException('Order not found');
-    }
-
-    if (order.razorpayOrderId !== razorpay_order_id) {
-      throw new ConflictException('Razorpay order does not match');
-    }
-
-    const razorpay = new Razorpay({
-      key_id: keyId,
-      key_secret: keySecret,
-    });
-
-    const payment = await razorpay.payments.fetch(razorpay_payment_id);
-
-    if (
-      payment.order_id !== order.razorpayOrderId ||
-      payment.amount !== order.totalPaise ||
-      payment.currency !== 'INR'
-    ) {
-      throw new ConflictException('Payment details do not match the order');
-    }
-
-    if (payment.status !== 'captured') {
-      throw new ConflictException(
-        `Payment is not captured (status: ${payment.status})`,
+        'Simulated payments are not configured',
       );
     }
 
     return this.prisma.$transaction(async (tx) => {
-      const locked = await tx.$queryRaw<{ id: string }[]>`
-        SELECT id FROM "Order" WHERE id = ${order.id} FOR UPDATE
+      const rows = await tx.$queryRaw<{ id: string }[]>`
+        SELECT id FROM "Order" WHERE id = ${normalizedId} FOR UPDATE
       `;
+      if (rows.length === 0) throw new NotFoundException('Order not found');
 
-      if (locked.length === 0) {
-        throw new NotFoundException('Order not found');
-      }
-
-      const current = await tx.order.findUniqueOrThrow({
-        where: { id: order.id },
+      const order = await tx.order.findUniqueOrThrow({
+        where: { id: normalizedId },
       });
-
-      if (current.status === 'PAID') {
-        return {
-          verified: true,
-          status: 'PAID',
-          orderId: current.id,
-        };
+      if (order.status !== 'HELD' || order.expiresAt <= new Date()) {
+        throw new ConflictException('Order is no longer eligible for payment');
       }
 
-      if (
-        current.status !== 'HELD' ||
-        current.expiresAt <= new Date()
-      ) {
-        if (current.status === 'HELD' || current.status === 'EXPIRED') {
-          await tx.order.update({
-            where: { id: current.id },
-            data: { status: 'NEEDS_REVIEW' },
-          });
-        }
-
-        throw new ConflictException(
-          'Order is no longer eligible for payment',
-        );
-      }
-
-      await tx.order.update({
-        where: { id: current.id },
-        data: { status: 'PAID' },
-      });
-
-      return {
-        verified: true,
-        status: 'PAID',
-        orderId: current.id,
+      const event: PaymentWebhook = {
+        eventId: randomUUID(),
+        orderId: order.id,
+        amountPaise: order.totalPaise,
+        status: 'captured',
       };
+      const result = await this.processEvent(tx, event, event, order);
+      if (result.outcome !== 'PAYMENT_ACCEPTED') {
+        throw new ConflictException('Order is no longer eligible for payment');
+      }
+
+      return { initiated: true, eventId: event.eventId, orderId: order.id };
     });
   }
 
+  private async processEvent(
+    tx: Prisma.TransactionClient,
+    event: PaymentWebhook,
+    payload: unknown,
+    lockedOrder?: PaymentOrder,
+  ) {
+    // Simulated payments pass the already locked row; webhook calls lock here.
+    const lockedOrders = lockedOrder
+      ? [{ id: lockedOrder.id }]
+      : await tx.$queryRaw<{ id: string }[]>`
+          SELECT id FROM "Order" WHERE id = ${event.orderId} FOR UPDATE
+        `;
+
+    await tx.paymentEvent.create({
+      data: {
+        eventId: event.eventId,
+        orderId: event.orderId,
+        amountPaise: event.amountPaise,
+        providerStatus: event.status,
+        payload: payload as Prisma.InputJsonValue,
+      },
+    });
+
+    if (lockedOrders.length === 0) {
+      return { received: true, outcome: 'ORDER_NOT_FOUND' };
+    }
+
+    const order =
+      lockedOrder ??
+      (await tx.order.findUniqueOrThrow({ where: { id: event.orderId } }));
+    if (event.status === 'FAILED') {
+      return { received: true, outcome: 'PAYMENT_FAILED' };
+    }
+
+    const amountMismatch = event.amountPaise !== order.totalPaise;
+    const lateOrIneligible =
+      order.status !== 'HELD' || order.expiresAt <= new Date();
+    if (amountMismatch || lateOrIneligible) {
+      if (order.status === 'HELD' || order.status === 'EXPIRED') {
+        await tx.order.update({
+          where: { id: order.id },
+          data: { status: 'NEEDS_REVIEW' },
+        });
+      }
+
+      return {
+        received: true,
+        outcome: amountMismatch
+          ? 'AMOUNT_MISMATCH_REVIEW'
+          : 'LATE_OR_INELIGIBLE_PAYMENT_REVIEW',
+      };
+    }
+
+    await tx.order.update({
+      where: { id: order.id },
+      data: { status: 'PAID' },
+    });
+    return {
+      received: true,
+      outcome: 'PAYMENT_ACCEPTED',
+      orderId: order.id,
+      status: 'PAID',
+    };
+  }
 
   async handleWebhook(
     body: unknown,
@@ -293,85 +202,9 @@ export class PaymentsService {
     };
 
     try {
-      return await this.prisma.$transaction(async (tx) => {
-        // Serialize payment events for the same order.
-        const lockedOrders = await tx.$queryRaw<{ id: string }[]>`
-          SELECT id
-          FROM "Order"
-          WHERE id = ${event.orderId}
-          FOR UPDATE
-        `;
-
-        // Store the event and update the order in the same transaction.
-        // The unique eventId constraint prevents duplicate processing.
-        await tx.paymentEvent.create({
-          data: {
-            eventId: event.eventId,
-            orderId: event.orderId,
-            amountPaise: event.amountPaise,
-            providerStatus: event.status,
-            payload: body as Prisma.InputJsonValue,
-          },
-        });
-
-        if (lockedOrders.length === 0) {
-          return {
-            received: true,
-            outcome: 'ORDER_NOT_FOUND',
-          };
-        }
-
-        const order = await tx.order.findUniqueOrThrow({
-          where: { id: event.orderId },
-        });
-
-        if (event.status === 'FAILED') {
-          return {
-            received: true,
-            outcome: 'PAYMENT_FAILED',
-          };
-        }
-
-        if (event.amountPaise !== order.totalPaise) {
-          if (order.status === 'HELD' || order.status === 'EXPIRED') {
-            await tx.order.update({
-              where: { id: order.id },
-              data: { status: 'NEEDS_REVIEW' },
-            });
-          }
-
-          return {
-            received: true,
-            outcome: 'AMOUNT_MISMATCH_REVIEW',
-          };
-        }
-
-        if (order.status !== 'HELD' || order.expiresAt <= new Date()) {
-          if (order.status === 'HELD' || order.status === 'EXPIRED') {
-            await tx.order.update({
-              where: { id: order.id },
-              data: { status: 'NEEDS_REVIEW' },
-            });
-          }
-
-          return {
-            received: true,
-            outcome: 'LATE_OR_INELIGIBLE_PAYMENT_REVIEW',
-          };
-        }
-
-        await tx.order.update({
-          where: { id: order.id },
-          data: { status: 'PAID' },
-        });
-
-        return {
-          received: true,
-          outcome: 'PAYMENT_ACCEPTED',
-          orderId: order.id,
-          status: 'PAID',
-        };
-      });
+      return await this.prisma.$transaction((tx) =>
+        this.processEvent(tx, event, body),
+      );
     } catch (error) {
       // A concurrent retry of the same event can hit the unique constraint.
       if (
