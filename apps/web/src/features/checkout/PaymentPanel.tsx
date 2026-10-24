@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { getOrderStatus, simulatePayment } from '../../lib/api';
 import { AlertTriangle, ArrowLeft, CheckCircle2, Clock3, Copy, LoaderCircle, RefreshCw, ShieldCheck } from 'lucide-react';
 import type {
@@ -42,6 +42,33 @@ export function PaymentPanel({ order, onBackToCatalog }: PaymentPanelProps) {
   const [paymentLoading, setPaymentLoading] = useState(false);
   const [paymentError, setPaymentError] = useState('');
   const [confirmationPending, setConfirmationPending] = useState(false);
+  const mountedRef = useRef(false);
+  const statusRequestRef = useRef<Promise<Awaited<ReturnType<typeof getOrderStatus>>> | null>(null);
+  const statusGenerationRef = useRef(0);
+  const confirmationPendingRef = useRef(false);
+  const paymentLoadingRef = useRef(false);
+  const immediateStatusPendingRef = useRef(false);
+
+  const setPending = useCallback((pending: boolean) => {
+    confirmationPendingRef.current = pending;
+    setConfirmationPending(pending);
+  }, []);
+
+  const readOrderStatus = useCallback(async (fresh = false) => {
+    while (statusRequestRef.current) {
+      const inFlight = statusRequestRef.current;
+      if (!fresh) return inFlight;
+      await inFlight.catch(() => undefined);
+    }
+
+    const request = getOrderStatus(order.id);
+    statusRequestRef.current = request;
+    try {
+      return await request;
+    } finally {
+      if (statusRequestRef.current === request) statusRequestRef.current = null;
+    }
+  }, [order.id]);
 
   useEffect(() => {
     // performance.now is monotonic and avoids relying on the customer's wall clock.
@@ -61,16 +88,28 @@ export function PaymentPanel({ order, onBackToCatalog }: PaymentPanelProps) {
     let stopped = false;
     let timeout: number | undefined;
     let failures = 0;
+    mountedRef.current = true;
 
     const poll = async () => {
+      const generation = statusGenerationRef.current;
       try {
-        const result = await getOrderStatus(order.id);
+        const result = await readOrderStatus();
         if (stopped) return;
+        if (generation !== statusGenerationRef.current) {
+          timeout = window.setTimeout(poll, 0);
+          return;
+        }
         failures = 0;
         setPollError('');
         setStatus(result.status);
-        if (confirmationPending && result.status === 'HELD') {
-          setConfirmationPending(false);
+        if (isTerminalStatus(result.status)) {
+          setPending(false);
+          setPaymentError('');
+        } else if (
+          result.status === 'HELD' && confirmationPendingRef.current &&
+          !paymentLoadingRef.current && !immediateStatusPendingRef.current
+        ) {
+          setPending(false);
           setPaymentError('The payment was not confirmed. You can try again while your reservation is active.');
         }
 
@@ -91,26 +130,62 @@ export function PaymentPanel({ order, onBackToCatalog }: PaymentPanelProps) {
     void poll();
     return () => {
       stopped = true;
+      mountedRef.current = false;
       if (timeout !== undefined) window.clearTimeout(timeout);
     };
-  }, [confirmationPending, order.id]);
+  }, [order.id, readOrderStatus, setPending]);
 
 
   const startPayment = async () => {
     if (paymentLoading || confirmationPending || terminal || secondsLeft <= 0) return;
 
+    paymentLoadingRef.current = true;
     setPaymentLoading(true);
     setPaymentError('');
+    statusGenerationRef.current += 1;
+    let simulationFailed = false;
     try {
-      await simulatePayment(order.id);
-      setConfirmationPending(true);
-      setPaymentError('Payment submitted. Waiting for order confirmation…');
-    } catch {
-      // The server may have completed payment even if the response was lost.
-      setConfirmationPending(true);
-      setPaymentError('Confirmation is taking longer than expected. Checking your order status…');
+      try {
+        await simulatePayment(order.id);
+      } catch {
+        // A lost response does not prove the simulated payment failed.
+        simulationFailed = true;
+      }
+
+      if (mountedRef.current) {
+        setPending(true);
+        setPaymentError(simulationFailed
+          ? 'Confirmation is taking longer than expected. Checking your order status…'
+          : 'Payment submitted. Waiting for order confirmation…');
+        statusGenerationRef.current += 1;
+        immediateStatusPendingRef.current = true;
+        try {
+          const result = await readOrderStatus(true);
+          if (mountedRef.current) {
+            setStatus(result.status);
+            if (isTerminalStatus(result.status)) {
+              setPending(false);
+              setPaymentError('');
+            } else if (result.status === 'HELD' && simulationFailed) {
+              setPending(false);
+              setPaymentError('The payment was not confirmed. You can try again while your reservation is active.');
+            } else {
+              setPending(true);
+              setPaymentError('Payment submitted. Waiting for order confirmation…');
+            }
+          }
+        } catch {
+          if (mountedRef.current) {
+            setPending(true);
+            setPaymentError('Confirmation is taking longer than expected. Checking your order status…');
+          }
+        } finally {
+          immediateStatusPendingRef.current = false;
+        }
+      }
     } finally {
-      setPaymentLoading(false);
+      paymentLoadingRef.current = false;
+      if (mountedRef.current) setPaymentLoading(false);
     }
   };
 
